@@ -1,3 +1,4 @@
+const { PDFParse } = require("pdf-Parse");
 const express = require("express");
 const multer = require("multer");
 const cors = require("cors");
@@ -22,6 +23,26 @@ app.post("/ocr", upload.single("file"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded. Use form-data key: file" });
     }
+
+    if (req.file.mimetype === "application/pdf"){
+        const parser = new PDFParse(new Uint8Array(req.file.buffer));
+
+        const textResult = await parser.getText();
+        const infoResult = await parser.getInfo({parsePageInfo: true});
+
+        return res.json({
+            meta:{
+                filename: req.file.originalname,
+                mimetype: req.file.mimetype,
+                sizeBytes: req.file.size,
+                pages: infoResult?.total || 0,
+            },
+            fullText: (textResult?.text || "").trim(),
+            method: "pdf-text-extraction",
+        });
+    }
+
+ 
 
     const worker = await createWorker("eng");
 
