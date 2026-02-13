@@ -11,7 +11,6 @@ app.use((req, res, next) => {
 app.use(cors());
 app.use(express.json());
 
-// store uploads in memory (good for small POC files)
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.get("/", (req, res) => {
@@ -29,7 +28,6 @@ app.post("/ocr", upload.single("file"), async (req, res) => {
     const result = await worker.recognize(req.file.buffer);
     const data = result.data;
 
-    // Transform into a clean JSON shape
     const response = {
       meta: {
         filename: req.file.originalname,
@@ -37,11 +35,11 @@ app.post("/ocr", upload.single("file"), async (req, res) => {
         sizeBytes: req.file.size,
       },
       fullText: data.text?.trim() || "",
-      confidence: data.confidence, // overall confidence
+      confidence: data.confidence, 
       words: (data.words || []).map(w => ({
         text: w.text,
         confidence: w.confidence,
-        bbox: w.bbox, // { x0, y0, x1, y1 }
+        bbox: w.bbox, 
       }))
     };
 
