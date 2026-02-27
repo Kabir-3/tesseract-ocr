@@ -158,6 +158,137 @@ function isoToParts(iso) {
   return { year: m[1], month: m[2], day: m[3] };
 }
 
+function safeStr(v) {
+  if (v == null) return "";
+  return String(v).trim();
+}
+
+function yesNoFr(v) {
+  if (v === true) return "Oui";
+  if (v === false) return "Non";
+  return "";
+}
+
+function yesNoEn(v) {
+  if (v === true) return "Yes";
+  if (v === false) return "No";
+  return "";
+}
+
+function chf(v) {
+  const s = safeStr(v);
+  return s ? `CHF ${s}` : "";
+}
+
+function normalizeCHFNumber(raw) {
+  if (!raw) return null;
+  const cleaned = String(raw)
+    .replace(/[^\d.,']/g, "")
+    .replace(/'/g, "")
+    .replace(/\s/g, "");
+  if (!cleaned) return null;
+  const normalized = cleaned.includes(",") && !cleaned.includes(".")
+    ? cleaned.replace(",", ".")
+    : cleaned.replace(/,/g, "");
+  const n = Number(normalized);
+  return Number.isFinite(n) ? n : null;
+}
+
+function findFirstMatch(text, regexList) {
+  for (const rx of regexList) {
+    const m = text.match(rx);
+    if (m?.[1]) return safeStr(m[1]);
+  }
+  return "";
+}
+
+function detectDocumentLanguage(text) {
+  const sample = (text || "").toLowerCase();
+  const frHints = ["nom", "prénom", "date de naissance", "poursuite", "garantie", "employeur", "adresse"];
+  const enHints = ["name", "date of birth", "debt", "guarantee", "employer", "address"];
+  const frScore = frHints.reduce((acc, k) => acc + (sample.includes(k) ? 1 : 0), 0);
+  const enScore = enHints.reduce((acc, k) => acc + (sample.includes(k) ? 1 : 0), 0);
+  if (frScore === 0 && enScore === 0) return "unknown";
+  return frScore >= enScore ? "fr" : "en";
+}
+
+async function extractTextFromUpload(file, preferredLang = "eng") {
+  if (!file) return { fullText: "", method: "none", pages: 0, confidence: null, language: "unknown" };
+
+  if (file.mimetype === "application/pdf") {
+    const parser = new PDFParse(new Uint8Array(file.buffer));
+    const textResult = await parser.getText();
+    const extractedText = (textResult?.text || "").trim();
+
+    if (extractedText.length > 50) {
+      const infoResult = await parser.getInfo({ parsePageInfo: true });
+      return {
+        fullText: extractedText,
+        method: "pdf-text-extraction",
+        pages: infoResult?.total || 0,
+        confidence: null,
+        language: detectDocumentLanguage(extractedText)
+      };
+    }
+
+    let tmpDir;
+    try {
+      const conv = await pdfToPngPaths(file.buffer);
+      tmpDir = conv.tmpDir;
+
+      let worker;
+      try {
+        worker = await createWorker(preferredLang);
+      } catch {
+        worker = await createWorker("eng");
+      }
+
+      const pages = [];
+      let merged = "";
+      let confidenceSum = 0;
+
+      for (let i = 0; i < conv.pngs.length; i++) {
+        const ocrRes = await worker.recognize(conv.pngs[i]);
+        const pageText = (ocrRes.data.text || "").trim();
+        const pageConfidence = ocrRes.data.confidence ?? 0;
+        confidenceSum += pageConfidence;
+        pages.push({ page: i + 1, confidence: pageConfidence, fullText: pageText });
+        merged += pageText + "\n";
+      }
+
+      await worker.terminate();
+      return {
+        fullText: merged.trim(),
+        method: "pdf-ocr-fallback",
+        pages: pages.length,
+        confidence: pages.length ? confidenceSum / pages.length : null,
+        language: detectDocumentLanguage(merged)
+      };
+    } finally {
+      await safeCleanupTmpDir(tmpDir);
+    }
+  }
+
+  let worker;
+  try {
+    worker = await createWorker(preferredLang);
+  } catch {
+    worker = await createWorker("eng");
+  }
+
+  const result = await worker.recognize(file.buffer);
+  await worker.terminate();
+
+  const fullText = result.data?.text?.trim() || "";
+  return {
+    fullText,
+    method: "image-ocr",
+    pages: 1,
+    confidence: result.data?.confidence ?? null,
+    language: detectDocumentLanguage(fullText)
+  };
+}
+
 async function pdfToPngPaths(pdfBuffer) {
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ocr-pdf-"));
@@ -302,6 +433,190 @@ app.post("/ocr", upload.single("file"), async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "OCR failed", details: err.message });
+  }
+});
+
+const vaudUpload = upload.fields([
+  { name: "idOrPassport", maxCount: 1 },
+  { name: "debtExtract", maxCount: 1 },
+  { name: "guaranteeCertificate", maxCount: 1 },
+  { name: "salarySlips", maxCount: 3 },
+  { name: "residencePermit", maxCount: 1 },
+  { name: "employmentProof", maxCount: 1 },
+  { name: "householdRcInsurance", maxCount: 1 }
+]);
+
+app.post("/vaud-intake", vaudUpload, async (req, res) => {
+  try {
+    const files = req.files || {};
+    const idFile = files.idOrPassport?.[0];
+    const debtFile = files.debtExtract?.[0];
+    const guaranteeFile = files.guaranteeCertificate?.[0];
+    const salaryFiles = files.salarySlips || [];
+    const permitFile = files.residencePermit?.[0];
+    const employmentProofFile = files.employmentProof?.[0];
+    const insuranceFile = files.householdRcInsurance?.[0];
+
+    if (!idFile || !debtFile || !guaranteeFile) {
+      return res.status(400).json({
+        error: "Missing required files",
+        required: ["idOrPassport", "debtExtract", "guaranteeCertificate"]
+      });
+    }
+
+    const idOcr = await extractTextFromUpload(idFile, "fra+eng");
+    const debtOcr = await extractTextFromUpload(debtFile, "fra+eng");
+    const guaranteeOcr = await extractTextFromUpload(guaranteeFile, "fra+eng");
+    const permitOcr = permitFile ? await extractTextFromUpload(permitFile, "fra+eng") : null;
+    const employmentOcr = employmentProofFile ? await extractTextFromUpload(employmentProofFile, "fra+eng") : null;
+    const insuranceOcr = insuranceFile ? await extractTextFromUpload(insuranceFile, "fra+eng") : null;
+
+    const salaryOcrs = [];
+    for (const salaryFile of salaryFiles) {
+      salaryOcrs.push(await extractTextFromUpload(salaryFile, "fra+eng"));
+    }
+    const salaryText = salaryOcrs.map(o => o.fullText).filter(Boolean).join("\n\n");
+    const salaryConf = salaryOcrs.map(o => o.confidence).filter(v => typeof v === "number");
+    const salaryConfidence = salaryConf.length ? salaryConf.reduce((a, b) => a + b, 0) / salaryConf.length : null;
+
+    const allText = [
+      idOcr.fullText,
+      debtOcr.fullText,
+      guaranteeOcr.fullText,
+      salaryText,
+      employmentOcr?.fullText || "",
+      permitOcr?.fullText || "",
+      insuranceOcr?.fullText || ""
+    ].filter(Boolean).join("\n\n");
+
+    const identityText = idOcr.fullText || allText;
+    const debtText = debtOcr.fullText || allText;
+    const guaranteeText = guaranteeOcr.fullText || allText;
+    const employmentText = `${employmentOcr?.fullText || ""}\n${salaryText}\n${allText}`;
+
+    const firstName = findFirstMatch(identityText, [/(?:pr[ée]nom|first\s*name)\s*[:\-]\s*([^\n\r]{2,80})/i]);
+    const lastName = findFirstMatch(identityText, [/(?:nom(?:\s*de\s*famille)?|last\s*name|surname)\s*[:\-]\s*([^\n\r]{2,80})/i]);
+    const dateOfBirth = findFirstMatch(identityText, [/(?:date\s*de\s*naissance|date\s*of\s*birth|n[ée]\s*le)\s*[:\-]?\s*([0-3]?\d[./-][01]?\d[./-]\d{2,4})/i]);
+    const nationality = findFirstMatch(identityText, [/(?:nationalit[ée]|nationality)\s*[:\-]\s*([^\n\r]{2,80})/i]);
+    const documentNumber = findFirstMatch(identityText, [/(?:passeport|passport|id|document)\s*(?:n[°o]|number|num[ée]ro)?\s*[:\-]?\s*([A-Z0-9-]{5,30})/i]);
+    const email = findFirstMatch(allText, [/\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b/i]);
+    const phone = findFirstMatch(allText, [/\b(\+41[\s\d()./-]{7,}|0\d[\d\s()./-]{7,})\b/]);
+    const currentAddress = findFirstMatch(allText, [/(?:adresse|address)\s*[:\-]\s*([^\n\r]{5,120})/i]);
+    const employer = findFirstMatch(employmentText, [/(?:employeur|employer)\s*[:\-]\s*([^\n\r]{2,120})/i]);
+    const role = findFirstMatch(employmentText, [/(?:poste|fonction|profession|role|position)\s*[:\-]\s*([^\n\r]{2,120})/i]);
+    const incomeRaw = findFirstMatch(employmentText, [
+      /(?:revenu|salaire|income)\s*[:\-]?\s*(?:chf|fr\.?)?\s*([0-9'.,\s]{3,20})/i,
+      /\b(?:chf|fr\.?)\s*([0-9'.,\s]{3,20})/i
+    ]);
+    const monthlyNetIncome = normalizeCHFNumber(incomeRaw);
+    const debtExtractDate = findFirstMatch(debtText, [/(?:date\s*(?:de\s*l['’])?extrait|date\s*d['’][ée]mission|issued\s*on)\s*[:\-]?\s*([0-3]?\d[./-][01]?\d[./-]\d{2,4})/i]);
+    const activeCountRaw = findFirstMatch(debtText, [/(\d+)\s*(?:poursuite|poursuites|debt\s*case|debt\s*cases)/i]);
+    const activePursuitsCount = activeCountRaw ? Number(activeCountRaw) : null;
+    const debtExtractStatus = /aucune?\s+(?:poursuite|inscription)|sans\s+poursuite|ne\s+comporte\s+aucune/i.test(debtText)
+      ? "clear"
+      : /(?:poursuite|poursuites|debt)\b/i.test(debtText)
+        ? "records_found"
+        : "";
+    const guaranteeAmountRaw = findFirstMatch(guaranteeText, [/(?:montant|garantie|deposit|caution)\s*[:\-]?\s*(?:chf|fr\.?)?\s*([0-9'.,\s]{3,20})/i]);
+    const guaranteeAmount = normalizeCHFNumber(guaranteeAmountRaw);
+    const guaranteeProvider = findFirstMatch(guaranteeText, [/(?:fournisseur\s*de\s*garantie|provider|garant(?:ie)?)\s*[:\-]\s*([^\n\r]{2,120})/i]);
+    const permitType = findFirstMatch(permitOcr?.fullText || allText, [/\b(?:permis|permit)\s*[:\-]?\s*([BCLG])\b/i]);
+
+    const profile = {
+      locale: "fr-CH",
+      canton: "VD",
+      applicant: {
+        first_name: firstName,
+        last_name: lastName,
+        full_name: `${firstName} ${lastName}`.trim(),
+        date_of_birth: dateOfBirth,
+        nationality,
+        phone,
+        email,
+        current_address: currentAddress,
+        permit_type: permitType,
+        document_number: documentNumber
+      },
+      employment: {
+        status: findFirstMatch(allText, [/(?:statut|status)\s*[:\-]\s*([^\n\r]{2,80})/i]),
+        employer,
+        role,
+        contract_type: findFirstMatch(allText, [/(?:contrat|contract)\s*[:\-]\s*([^\n\r]{2,80})/i]),
+        monthly_net_income_chf: monthlyNetIncome
+      },
+      financial: {
+        debt_extract_date: debtExtractDate,
+        debt_extract_status: debtExtractStatus,
+        active_pursuits_count: activePursuitsCount,
+        guarantee_amount_chf: guaranteeAmount,
+        guarantee_provider: guaranteeProvider
+      },
+      documents: {
+        id_or_passport: { provided: !!idFile, language: idOcr.language, confidence: idOcr.confidence },
+        debt_extract: { provided: !!debtFile, language: debtOcr.language, confidence: debtOcr.confidence },
+        guarantee_certificate: { provided: !!guaranteeFile, language: guaranteeOcr.language, confidence: guaranteeOcr.confidence },
+        salary_slips_3m: { provided: salaryFiles.length > 0, language: detectDocumentLanguage(salaryText), confidence: salaryConfidence },
+        residence_permit: { provided: !!permitFile, language: permitOcr?.language || "unknown", confidence: permitOcr?.confidence ?? null },
+        employment_proof: { provided: !!employmentProofFile, language: employmentOcr?.language || "unknown", confidence: employmentOcr?.confidence ?? null },
+        household_rc_insurance: { provided: !!insuranceFile, language: insuranceOcr?.language || "unknown", confidence: insuranceOcr?.confidence ?? null }
+      }
+    };
+
+    const missingRequired = [
+      !profile.documents.id_or_passport.provided ? "id_or_passport" : null,
+      !profile.documents.debt_extract.provided ? "debt_extract" : null,
+      !profile.documents.guarantee_certificate.provided ? "guarantee_certificate" : null
+    ].filter(Boolean);
+
+    const cvInput = {
+      identity: {
+        firstName: profile.applicant.first_name,
+        lastName: profile.applicant.last_name,
+        dateOfBirth: profile.applicant.date_of_birth,
+        nationality: profile.applicant.nationality,
+        documentType: profile.documents.id_or_passport.provided ? "ID/Passport" : "",
+        documentNumber: profile.applicant.document_number
+      },
+      contact: {
+        currentAddress: profile.applicant.current_address,
+        phone: profile.applicant.phone,
+        email: profile.applicant.email
+      },
+      employment: {
+        employer: profile.employment.employer,
+        position: profile.employment.role,
+        annualIncomeCHF: profile.employment.monthly_net_income_chf
+      },
+      financial: {
+        debtExtractDate: profile.financial.debt_extract_date,
+        hasDebtRecord: profile.financial.debt_extract_status === "records_found",
+        guaranteeAmountCHF: profile.financial.guarantee_amount_chf,
+        guaranteeProvider: profile.financial.guarantee_provider
+      },
+      documents: {
+        idUploaded: profile.documents.id_or_passport.provided,
+        debtExtractUploaded: profile.documents.debt_extract.provided,
+        guaranteeUploaded: profile.documents.guarantee_certificate.provided
+      }
+    };
+
+    return res.json({
+      profile: {
+        ...profile,
+        missing_required_docs: missingRequired,
+        cv_ready: Boolean(cvInput.identity.firstName && cvInput.identity.lastName && cvInput.documents.idUploaded && cvInput.documents.debtExtractUploaded && cvInput.documents.guaranteeUploaded)
+      },
+      cv_input: cvInput,
+      extraction_meta: {
+        id_or_passport: { method: idOcr.method, pages: idOcr.pages, language: idOcr.language },
+        debt_extract: { method: debtOcr.method, pages: debtOcr.pages, language: debtOcr.language },
+        guarantee_certificate: { method: guaranteeOcr.method, pages: guaranteeOcr.pages, language: guaranteeOcr.language },
+        salary_slips_3m: { method: salaryFiles.length ? "multi-file" : "none", pages: salaryOcrs.reduce((sum, o) => sum + (o.pages || 0), 0), language: detectDocumentLanguage(salaryText) }
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Vaud intake failed", details: err.message });
   }
 });
 
@@ -516,6 +831,234 @@ app.get("/debug/fields/wincasa", async (req, res) => {
     name: f.getName(),
     type: f.constructor?.name || "Unknown"
   })));
+});
+
+// Generate bilingual tenant CV PDF from JSON
+app.post("/generate-cv", async (req, res) => {
+  try {
+    const body = req.body || {};
+    // Accept either direct payload or wrapped: { data: {...} }
+    const data = body.data ?? body;
+
+    const identity = data.identity ?? {};
+    const contact = data.contact ?? {};
+    const employment = data.employment ?? {};
+    const financial = data.financial ?? {};
+    const documents = data.documents ?? {};
+
+    const pdfDoc = await PDFDocument.create();
+
+    // --- Page 1: French ---
+    const pageFr = pdfDoc.addPage([595.28, 841.89]); // A4
+    const { height: h1 } = pageFr.getSize();
+
+    // Header bar
+    pageFr.drawRectangle({
+      x: 0,
+      y: h1 - 80,
+      width: 595.28,
+      height: 80,
+    });
+
+    const margin = 50;
+    let y = h1 - margin;
+
+    const titleSize = 18;
+    const headingSize = 12;
+    const textSize = 11;
+    const lineGap = 16;
+
+    const draw = (page, txt, x, y, size = textSize) => {
+      page.drawText(txt ?? "", { x, y, size });
+    };
+
+    // Title (polished)
+    draw(pageFr, "Canton de Vaud – Dossier locataire", margin, h1 - 45, 16);
+    y -= 60;
+
+    // Identity
+    draw(pageFr, "Identité", margin, y, headingSize);
+    pageFr.drawLine({
+      start: { x: margin, y: y - 6 },
+      end: { x: 545, y: y - 6 },
+      thickness: 0.5
+    });
+    y -= 18;
+    draw(pageFr, `Nom: ${safeStr(identity.firstName)} ${safeStr(identity.lastName)}`.trim(), margin, y);
+    y -= lineGap;
+    draw(pageFr, `Date de naissance: ${safeStr(identity.dateOfBirth)}`, margin, y);
+    y -= lineGap;
+    draw(pageFr, `Nationalité: ${safeStr(identity.nationality)}`, margin, y);
+    y -= lineGap;
+    draw(pageFr, `Document: ${safeStr(identity.documentType)} ${safeStr(identity.documentNumber)}`.trim(), margin, y);
+    y -= 26;
+
+    // Contact
+    draw(pageFr, "Coordonnées", margin, y, headingSize);
+    pageFr.drawLine({
+      start: { x: margin, y: y - 6 },
+      end: { x: 545, y: y - 6 },
+      thickness: 0.5
+    });
+    y -= 18;
+    draw(pageFr, `Adresse actuelle: ${safeStr(contact.currentAddress)}`, margin, y);
+    y -= lineGap;
+    draw(pageFr, `Téléphone: ${safeStr(contact.phone)}`, margin, y);
+    y -= lineGap;
+    draw(pageFr, `Email: ${safeStr(contact.email)}`, margin, y);
+    y -= 26;
+
+    // Employment
+    draw(pageFr, "Situation professionnelle", margin, y, headingSize);
+    pageFr.drawLine({
+      start: { x: margin, y: y - 6 },
+      end: { x: 545, y: y - 6 },
+      thickness: 0.5
+    });
+    y -= 18;
+    draw(pageFr, `Employeur: ${safeStr(employment.employer)}`, margin, y);
+    y -= lineGap;
+    draw(pageFr, `Poste: ${safeStr(employment.position)}`, margin, y);
+    y -= lineGap;
+    draw(pageFr, `Revenu annuel: ${safeStr(employment.annualIncomeCHF) ? chf(employment.annualIncomeCHF) : ""}`, margin, y);
+    y -= 26;
+
+    // Financial
+    draw(pageFr, "Situation financière", margin, y, headingSize);
+    pageFr.drawLine({
+      start: { x: margin, y: y - 6 },
+      end: { x: 545, y: y - 6 },
+      thickness: 0.5
+    });
+    y -= 18;
+    draw(pageFr, `Extrait des poursuites (date): ${safeStr(financial.debtExtractDate)}`, margin, y);
+    y -= lineGap;
+    draw(pageFr, `A des poursuites / dettes: ${yesNoFr(financial.hasDebtRecord)}`, margin, y);
+    y -= lineGap;
+    draw(pageFr, `Garantie: ${safeStr(financial.guaranteeAmountCHF) ? chf(financial.guaranteeAmountCHF) : ""}`, margin, y);
+    y -= lineGap;
+    draw(pageFr, `Fournisseur garantie: ${safeStr(financial.guaranteeProvider)}`, margin, y);
+    y -= 26;
+
+    // Documents
+    draw(pageFr, "Documents fournis", margin, y, headingSize);
+    pageFr.drawLine({
+      start: { x: margin, y: y - 6 },
+      end: { x: 545, y: y - 6 },
+      thickness: 0.5
+    });
+    y -= 18;
+    draw(pageFr, `ID/Passport: ${yesNoFr(documents.idUploaded)}`, margin, y);
+    y -= lineGap;
+    draw(pageFr, `Extrait des poursuites: ${yesNoFr(documents.debtExtractUploaded)}`, margin, y);
+    y -= lineGap;
+    draw(pageFr, `Certificat de garantie: ${yesNoFr(documents.guaranteeUploaded)}`, margin, y);
+
+    // Footer (polished)
+    draw(pageFr, `Généré le: ${new Date().toISOString().slice(0, 10)}  |  Informations fournies par le candidat`, margin, 25, 8);
+
+    // --- Page 2: English ---
+    const pageEn = pdfDoc.addPage([595.28, 841.89]);
+    const { height: h2 } = pageEn.getSize();
+
+    // Header bar
+    pageEn.drawRectangle({
+      x: 0,
+      y: h2 - 80,
+      width: 595.28,
+      height: 80,
+    });
+
+    y = h2 - margin;
+    // Title (polished)
+    draw(pageEn, "Canton of Vaud – Tenant Dossier", margin, h2 - 45, 16);
+    y -= 60;
+
+    draw(pageEn, "Identity", margin, y, headingSize);
+    pageEn.drawLine({
+      start: { x: margin, y: y - 6 },
+      end: { x: 545, y: y - 6 },
+      thickness: 0.5
+    });
+    y -= 18;
+    draw(pageEn, `Name: ${safeStr(identity.firstName)} ${safeStr(identity.lastName)}`.trim(), margin, y);
+    y -= lineGap;
+    draw(pageEn, `Date of birth: ${safeStr(identity.dateOfBirth)}`, margin, y);
+    y -= lineGap;
+    draw(pageEn, `Nationality: ${safeStr(identity.nationality)}`, margin, y);
+    y -= lineGap;
+    draw(pageEn, `Document: ${safeStr(identity.documentType)} ${safeStr(identity.documentNumber)}`.trim(), margin, y);
+    y -= 26;
+
+    draw(pageEn, "Contact", margin, y, headingSize);
+    pageEn.drawLine({
+      start: { x: margin, y: y - 6 },
+      end: { x: 545, y: y - 6 },
+      thickness: 0.5
+    });
+    y -= 18;
+    draw(pageEn, `Current address: ${safeStr(contact.currentAddress)}`, margin, y);
+    y -= lineGap;
+    draw(pageEn, `Phone: ${safeStr(contact.phone)}`, margin, y);
+    y -= lineGap;
+    draw(pageEn, `Email: ${safeStr(contact.email)}`, margin, y);
+    y -= 26;
+
+    draw(pageEn, "Employment", margin, y, headingSize);
+    pageEn.drawLine({
+      start: { x: margin, y: y - 6 },
+      end: { x: 545, y: y - 6 },
+      thickness: 0.5
+    });
+    y -= 18;
+    draw(pageEn, `Employer: ${safeStr(employment.employer)}`, margin, y);
+    y -= lineGap;
+    draw(pageEn, `Role: ${safeStr(employment.position)}`, margin, y);
+    y -= lineGap;
+    draw(pageEn, `Annual income: ${safeStr(employment.annualIncomeCHF) ? chf(employment.annualIncomeCHF) : ""}`, margin, y);
+    y -= 26;
+
+    draw(pageEn, "Financial", margin, y, headingSize);
+    pageEn.drawLine({
+      start: { x: margin, y: y - 6 },
+      end: { x: 545, y: y - 6 },
+      thickness: 0.5
+    });
+    y -= 18;
+    draw(pageEn, `Debt extract date: ${safeStr(financial.debtExtractDate)}`, margin, y);
+    y -= lineGap;
+    draw(pageEn, `Debt record: ${yesNoEn(financial.hasDebtRecord)}`, margin, y);
+    y -= lineGap;
+    draw(pageEn, `Guarantee: ${safeStr(financial.guaranteeAmountCHF) ? chf(financial.guaranteeAmountCHF) : ""}`, margin, y);
+    y -= lineGap;
+    draw(pageEn, `Guarantee provider: ${safeStr(financial.guaranteeProvider)}`, margin, y);
+    y -= 26;
+
+    draw(pageEn, "Documents provided", margin, y, headingSize);
+    pageEn.drawLine({
+      start: { x: margin, y: y - 6 },
+      end: { x: 545, y: y - 6 },
+      thickness: 0.5
+    });
+    y -= 18;
+    draw(pageEn, `ID/Passport: ${yesNoEn(documents.idUploaded)}`, margin, y);
+    y -= lineGap;
+    draw(pageEn, `Debt extract: ${yesNoEn(documents.debtExtractUploaded)}`, margin, y);
+    y -= lineGap;
+    draw(pageEn, `Guarantee certificate: ${yesNoEn(documents.guaranteeUploaded)}`, margin, y);
+
+    // Footer (polished)
+    draw(pageEn, `Generated on: ${new Date().toISOString().slice(0, 10)}  |  Information provided by applicant`, margin, 25, 8);
+
+    const outBytes = await pdfDoc.save();
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="tenant-profile-bilingual.pdf"');
+    return res.send(Buffer.from(outBytes));
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "CV generation failed", details: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
